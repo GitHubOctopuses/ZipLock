@@ -1,0 +1,12 @@
+# Build artifacts
+ZipLock.exe
+app.res.o
+default-manifest.o
+
+# Local screenshots / test output
+*.png
+gui_smoke*/
+prog_test*/
+
+# Local dev/test scripts (hardcoded local paths)
+*.ps1
