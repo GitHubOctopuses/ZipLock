@@ -10,3 +10,6 @@ prog_test*/
 
 # Local dev/test scripts (hardcoded local paths)
 *.ps1
+
+# keep the UI screenshot referenced by README
+!docs/screenshot.png

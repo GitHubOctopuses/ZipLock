@@ -1,6 +1,6 @@
-// 7z 批量加密/解密工具
+// ZipLock — 7z 批量加密/解密工具
 // 引擎: LZMA SDK (Igor Pavlov, public domain) 自带的 7zr.exe，与本程序放在同一目录。
-// 加密: 递归把文件夹内每个文件(跳过 .7z)压成 原名+.7z，AES-256 + 文件名加密，成功后删除原文件。
+// 加密: 递归把文件夹内每个文件(跳过 .7z 与程序自身)压成 原名+.7z，AES-256 + 文件名加密，成功后删除原文件。
 // 解密: 递归把文件夹内每个 .7z 解回原文件，成功后删除 .7z。
 // 编译: build.bat
 
@@ -28,6 +28,8 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <algorithm>
+#include <cwctype>
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
@@ -63,7 +65,7 @@ enum { MODE_ENCRYPT = 1, MODE_DECRYPT = 2 };
 enum {
     IDC_APPICON = 100, IDC_LABEL_PATH, IDC_EDIT, IDC_BROWSE,
     IDC_ENCRYPT, IDC_DECRYPT, IDC_PROGRESS, IDC_STATUS, IDC_DETAIL, IDC_SEP,
-    IDC_KEYEDIT, IDC_LABEL_KEY
+    IDC_KEYEDIT, IDC_LABEL_KEY, IDC_SHOWKEY
 };
 
 // 工作线程 -> UI 消息
@@ -77,9 +79,9 @@ enum {
 
 // ---------------- 全局 ----------------
 static HWND  g_hwnd, g_icon, g_labelPath, g_edit, g_browse, g_btnEnc, g_btnDec, g_prog, g_status, g_detail;
-static HWND  g_keyEdit, g_labelKey, g_sep;
+static HWND  g_keyEdit, g_labelKey, g_sep, g_showKey;
 static HFONT g_font, g_fontSmall;
-static HBRUSH g_bgBrush;
+static HBRUSH g_bgBrush, g_sepBrush;
 static HINSTANCE g_hInst;
 static int   g_dpi = 96;
 static bool  g_hover[3] = { false, false, false };   // encrypt / decrypt / browse
@@ -90,11 +92,16 @@ static bool g_busy = false, g_quitPending = false;
 static int Scale(int x) { return MulDiv(x, g_dpi, 96); }
 
 // ---------------- 7zr.exe 调用 ----------------
-static std::wstring SevenZrPath()
+static std::wstring SelfExePath()
 {
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring dir = buf;
+    return buf;
+}
+
+static std::wstring SevenZrPath()
+{
+    std::wstring dir = SelfExePath();
     size_t p = dir.find_last_of(L"\\/");
     return dir.substr(0, p + 1) + L"7zr.exe";
 }
@@ -143,6 +150,19 @@ static SevenZrResult Run7z(const std::wstring& args)
     r.exitCode = (int)code;
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return r;
+}
+
+// 统一路径形态（weakly_canonical + 正斜杠 + 小写）后比较。
+// 直接字符串比较会被斜杠方向/大小写/8.3短路径名差异骗过，导致自毁保护漏判。
+static std::wstring NormalizeForCompare(const fs::path& p)
+{
+    std::error_code ec;
+    fs::path c = fs::weakly_canonical(p, ec);
+    if (ec || c.empty()) c = fs::absolute(p, ec);
+    std::wstring s = c.generic_wstring();
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](wchar_t ch) { return (wchar_t)towlower(ch); });
+    return s;
 }
 
 // ---------------- 任务核心（GUI 与 CLI 共用） ----------------
@@ -201,13 +221,23 @@ static void EncryptTask(const std::wstring& rootW, const std::wstring& key, cons
 {
     const wchar_t* what = L"加密";
     Stats st;
+    std::error_code ec0;
     std::vector<fs::path> files;
     try {
         cb.onStatus(L"正在扫描文件…");
-        files = Collect(fs::path(rootW), false);
+        files = Collect(fs::absolute(fs::path(rootW), ec0), false);
     } catch (...) {
         cb.onDone(L"扫描失败：无法读取该文件夹");
         return;
+    }
+    // 绝不加密程序自身与 7zr.exe：删掉引擎后后续文件会全部失败
+    {
+        std::wstring selfExe = NormalizeForCompare(fs::path(SelfExePath()));
+        std::wstring sevenzr = NormalizeForCompare(fs::path(SevenZrPath()));
+        files.erase(std::remove_if(files.begin(), files.end(), [&](const fs::path& p) {
+            std::wstring ap = NormalizeForCompare(p);
+            return ap == selfExe || ap == sevenzr;
+        }), files.end());
     }
     int N = (int)files.size();
     cb.onRange(N);
@@ -241,6 +271,8 @@ static void EncryptTask(const std::wstring& rootW, const std::wstring& key, cons
             }
             st.ok++;
         } else {
+            // 清掉失败残留的不完整 .7z：否则下次运行会因"同名包已存在"跳过，原文件永远加密不上
+            if (fs::exists(out, ec)) fs::remove(out, ec);
             st.fail++;
             cb.onStatus(head + f.filename().wstring() +
                         L"　[失败：原文件已保留]（7zr 退出码 " +
@@ -284,7 +316,8 @@ static void DecryptTask(const std::wstring& rootW, const std::wstring& key, cons
         std::wstring args = std::wstring(L"x -p\"") + key + L"\" -y -o\"" +
                             arc.parent_path().wstring() + L"\" -- \"" + arc.wstring() + L"\"";
         SevenZrResult r = Run7z(args);
-        bool ok = r.started && r.exitCode == 0 && fs::exists(target, ec) && !ec;
+        // 以退出码判定成功：兼容外部制作的多文件 .7z（内部文件名与包名不一致的情况）
+        bool ok = r.started && r.exitCode == 0;
         if (ok) {
             if (!DeleteFileW(arc.c_str())) {
                 st.delFail++;
@@ -294,6 +327,8 @@ static void DecryptTask(const std::wstring& rootW, const std::wstring& key, cons
             }
             st.ok++;
         } else {
+            // 解压失败时清掉解了一半的残留文件（此前它不存在，是本次解压产生的），避免下次被"同名跳过"
+            if (fs::exists(target, ec)) fs::remove(target, ec);
             st.fail++;
             cb.onStatus(head + arc.filename().wstring() +
                         L"　[失败：.7z 已保留]（7zr 退出码 " +
@@ -384,6 +419,12 @@ static bool IsDriveRoot(const std::wstring& p)
     std::wstring t = p;
     if (t.size() == 2 && t[1] == L':') return true;
     if (t.size() == 3 && t[1] == L':' && (t[2] == L'\\' || t[2] == L'/')) return true;
+    // UNC 网络共享根（\\server\share）视同整盘
+    if (t.size() > 2 && t[0] == L'\\' && t[1] == L'\\') {
+        while (!t.empty() && t.back() == L'\\') t.pop_back();
+        int n = (int)std::count(t.begin() + 2, t.end(), L'\\');
+        return n <= 1;
+    }
     return false;
 }
 
@@ -545,7 +586,9 @@ static void Layout()
     MoveWindow(g_browse, bx, Scale(18), bw, eh, TRUE);
 
     MoveWindow(g_labelKey, rx, Scale(59), lw, Scale(17), TRUE);
-    MoveWindow(g_keyEdit, ix, Scale(52), W - m - ix, eh, TRUE);
+    int cw = Scale(56);
+    MoveWindow(g_keyEdit, ix, Scale(52), W - m - ix - cw - gap, eh, TRUE);
+    MoveWindow(g_showKey, W - m - cw, Scale(56), cw, Scale(22), TRUE);
 
     MoveWindow(g_btnEnc, ix, Scale(94), Scale(130), bh, TRUE);
     MoveWindow(g_btnDec, ix + Scale(138), Scale(94), Scale(130), bh, TRUE);
@@ -563,15 +606,24 @@ static HFONT MakeFontPt(int pt, int dpi)
                        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 }
 
+// 应用图标：设置到 SS_ICON 控件并回收旧句柄，避免 DPI 切换时泄漏
+static void SetAppIcon(int size)
+{
+    HICON hNew = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                   size, size, LR_DEFAULTCOLOR);
+    HICON hOld = (HICON)SendMessageW(g_icon, STM_SETIMAGE, IMAGE_ICON, (LPARAM)hNew);
+    if (hOld) DestroyIcon(hOld);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE:
         g_bgBrush = CreateSolidBrush(kBg);
+        g_sepBrush = CreateSolidBrush(kSep);
         g_icon = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_ICON, 0, 0, 0, 0, hwnd, (HMENU)IDC_APPICON, nullptr, nullptr);
-        SendMessageW(g_icon, STM_SETIMAGE, IMAGE_ICON,
-            (LPARAM)LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, Scale(48), Scale(48), LR_DEFAULTCOLOR));
+        SetAppIcon(Scale(48));
         g_labelPath = CreateWindowExW(0, L"STATIC", L"文件夹路径:",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)IDC_LABEL_PATH, nullptr, nullptr);
         g_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -586,6 +638,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             0, 0, 0, 0, hwnd, (HMENU)IDC_KEYEDIT, nullptr, nullptr);
         SendMessageW(g_keyEdit, EM_SETCUEBANNER, FALSE,
             (LPARAM)L"输入密钥（加密与解密必须一致）");
+        g_showKey = CreateWindowExW(0, L"BUTTON", L"显示",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_SHOWKEY, nullptr, nullptr);
         g_browse = CreateWindowExW(0, L"BUTTON", L"浏览…",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd, (HMENU)IDC_BROWSE, nullptr, nullptr);
@@ -612,15 +667,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)IDC_DETAIL, nullptr, nullptr);
         return 0;
 
-    case WM_SETFONT: return 0;
     case WM_DPICHANGED: {
         g_dpi = HIWORD(wp);
         if (g_font) DeleteObject(g_font);
         if (g_fontSmall) DeleteObject(g_fontSmall);
         g_font = MakeFontPt(9, g_dpi);
         g_fontSmall = MakeFontPt(8, g_dpi);
-        SendMessageW(g_icon, STM_SETIMAGE, IMAGE_ICON,
-            (LPARAM)LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, Scale(48), Scale(48), LR_DEFAULTCOLOR));
+        SetAppIcon(Scale(48));
         EnumChildWindows(hwnd, [](HWND c, LPARAM lp) -> BOOL {
             SendMessageW(c, WM_SETFONT, (WPARAM)(HFONT)lp, TRUE); return TRUE;
         }, (LPARAM)g_font);
@@ -634,6 +687,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE: Layout(); return 0;
 
     case WM_CTLCOLORDLG:
+        return (LRESULT)g_bgBrush;
+
+    case WM_CTLCOLORBTN:
+        // 让"显示"复选框文字背景与窗口一致
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetTextColor((HDC)wp, kTextSub);
         return (LRESULT)g_bgBrush;
 
     case WM_CTLCOLORSTATIC: {
@@ -650,7 +709,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else
             SetTextColor(hdc, kTextMain);
         if (id == IDC_SEP)
-            return (LRESULT)CreateSolidBrush(kSep);
+            return (LRESULT)g_sepBrush;   // 复用同一画刷；按消息新建会随重绘泄漏 GDI 句柄
         return (LRESULT)g_bgBrush;
     }
 
@@ -681,6 +740,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         case IDC_ENCRYPT: StartTask(MODE_ENCRYPT); return 0;
         case IDC_DECRYPT: StartTask(MODE_DECRYPT); return 0;
+        case IDC_SHOWKEY: {
+            bool show = SendMessageW(g_showKey, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            LONG_PTR st = GetWindowLongPtrW(g_keyEdit, GWL_STYLE);
+            SetWindowLongPtrW(g_keyEdit, GWL_STYLE, show ? (st & ~ES_PASSWORD) : (st | ES_PASSWORD));
+            SetWindowPos(g_keyEdit, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            SetFocus(g_keyEdit);
+            return 0;
+        }
         }
         break;
 
@@ -721,6 +789,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        if (g_icon) {
+            HICON h = (HICON)SendMessageW(g_icon, STM_GETIMAGE, IMAGE_ICON, 0);
+            if (h) DestroyIcon(h);
+        }
+        if (g_bgBrush) DeleteObject(g_bgBrush);
+        if (g_sepBrush) DeleteObject(g_sepBrush);
         PostQuitMessage(0);
         return 0;
     }
@@ -757,10 +831,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow)
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
     wc.hIconSm = wc.hIcon;
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"SevenZipBatchToolWnd";
+    wc.lpszClassName = L"ZipLockWnd";
     RegisterClassExW(&wc);
 
-    // 固定客户区约 600x188，再换算成窗口外框尺寸
+    // 固定客户区约 600x240，再换算成窗口外框尺寸
     RECT rc{ 0, 0, Scale(600), Scale(240) };
     AdjustWindowRectExForDpi(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                              FALSE, 0, g_dpi);
